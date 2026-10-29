@@ -19,6 +19,7 @@ Optional:
                        regardless of availability.
 """
 
+import html as html_lib
 import json
 import os
 import re
@@ -117,6 +118,11 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
+def esc(s):
+    """Escape text for Telegram HTML mode."""
+    return html_lib.escape(str(s), quote=False)
+
+
 def telegram(text):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -124,7 +130,12 @@ def telegram(text):
         print("!! TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; would have sent:\n" + text)
         return False
     data = urllib.parse.urlencode(
-        {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"}
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
     ).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage", data=data
@@ -283,11 +294,11 @@ def main():
         if state["error_streak"] in (6, 42, 78):
             telegram(
                 f"⚠️ iPhone Duo checker: Apple's site has refused or failed "
-                f"{state['error_streak']} checks in a row ({e}). It may be blocking "
+                f"{state['error_streak']} checks in a row ({esc(e)}). It may be blocking "
                 f"GitHub's servers — check the Actions log."
             )
         if test_mode:
-            telegram(f"🧪 iPhone Duo checker test — FAILED: {e}")
+            telegram(f"🧪 iPhone Duo checker test — FAILED: {esc(e)}")
         save_state(state)
         sys.exit(0)
 
@@ -297,13 +308,28 @@ def main():
 
     sig = "|".join(sorted(f"{s}:{l}" for s, l, _ in available))
 
+    in_stock = {(s, l) for s, l, _ in available}
+
+    def status_lines():
+        """One line per store/config; in-stock ones in bold."""
+        out = []
+        for (store, label), msg in sorted(seen.items()):
+            line = f"{esc(store)} — {esc(label)}: {esc(msg)}"
+            if (store, label) in in_stock:
+                line = f"<b>🟢 {line}</b>"
+            else:
+                line = f"• {line}"
+            out.append(line)
+        return "\n".join(out)
+
     if available:
-        lines = ["🟢 iPhone Duo available for pickup NOW", ""]
+        lines = ["<b>🟢 iPhone Duo available for pickup NOW</b>", ""]
         by_store = {}
         for store, label, quote in available:
             by_store.setdefault(store, []).append(label)
         for store, labels in by_store.items():
-            lines.append(f"📍 {store}: " + ", ".join(sorted(set(labels))))
+            bold = ", ".join(f"<b>{esc(l)}</b>" for l in sorted(set(labels)))
+            lines.append(f"📍 {esc(store)}: {bold}")
         lines += ["", "Buy: " + BUY_URL, "Limit 2 per customer. Go go go.", f"({now_sgt()})"]
         text = "\n".join(lines)
         if sig != state.get("last_alert_sig") or test_mode:
@@ -313,13 +339,10 @@ def main():
     else:
         print("Nothing available for pickup.")
         if test_mode:
-            summary = "\n".join(
-                f"• {store} — {label}: {msg}" for (store, label), msg in sorted(seen.items())
-            )
             telegram(
                 f"🧪 iPhone Duo checker test OK ({now_sgt()})\n"
                 f"Checked {len(parts)} configs. Nothing available for pickup right now.\n\n"
-                f"{summary[:3000]}"
+                f"{status_lines()[:3500]}"
             )
 
     state["last_alert_sig"] = sig

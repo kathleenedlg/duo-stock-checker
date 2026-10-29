@@ -1,0 +1,52 @@
+name: iPhone Duo pickup check
+
+on:
+  schedule:
+    # Every 10 minutes, 8:00am–11:50pm Singapore time (00:00–15:50 UTC).
+    # GitHub may delay scheduled runs by a few minutes when busy.
+    - cron: "*/10 0-15 * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a Telegram test message with the full status"
+        type: boolean
+        default: true
+
+concurrency:
+  group: duo-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Restore the small state file so we don't re-alert on the same stock
+      # every 10 minutes, and so discovered part numbers are cached.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: duo-state-${{ github.run_id }}
+          restore-keys: duo-state-
+
+      - name: Run checker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PART_NUMBERS: ${{ secrets.PART_NUMBERS }}
+          TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '' }}
+        run: python check_duo.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: duo-state-${{ github.run_id }}

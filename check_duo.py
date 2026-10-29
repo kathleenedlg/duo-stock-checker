@@ -50,25 +50,58 @@ CONFIGS = [
 # Postcodes that make Apple's store search return the Singapore stores.
 LOCATIONS = ["238801"]  # Orchard Road; the search returns all nearby SG stores
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-SG,en;q=0.9",
-    "Referer": BUY_URL,
-}
+import http.cookiejar
+
+# Several browser identities; Apple's edge sometimes accepts one and not another.
+USER_AGENTS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 19_1 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/19.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/19.1 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+]
+_ua_index = 0
+
+# One cookie jar for the whole run so a normal page load can hand us cookies
+# that the availability endpoint then accepts.
+_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_jar))
+
+
+def _headers(json_req=False):
+    h = {
+        "User-Agent": USER_AGENTS[_ua_index % len(USER_AGENTS)],
+        "Accept": "application/json, text/plain, */*" if json_req
+        else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-SG,en;q=0.9",
+        "Referer": BUY_URL,
+        "Cache-Control": "no-cache",
+    }
+    if json_req:
+        h["X-Requested-With"] = "Fetch"
+    return h
 
 
 def now_sgt():
     return datetime.now(SGT).strftime("%a %d %b, %H:%M")
 
 
-def http_get(url, timeout=25):
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+def http_get(url, timeout=25, json_req=False):
+    req = urllib.request.Request(url, headers=_headers(json_req))
+    with _opener.open(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
+
+
+def warm_up():
+    """Load an ordinary Apple page first so we hold the usual cookies."""
+    try:
+        http_get(BUY_URL)
+        print("Warm-up page loaded; cookies:", len(_jar))
+        return True
+    except Exception as e:
+        print("Warm-up failed:", e)
+        return False
 
 
 def load_state():
@@ -156,6 +189,7 @@ def discover_parts(state):
 def check_pickup(parts):
     """Return list of (store, label, quote) for configs available for pickup,
     plus a dict of everything seen, for test-mode reporting."""
+    global _ua_index
     available = []
     seen = {}
     part_list = list(parts.keys())
@@ -163,17 +197,36 @@ def check_pickup(parts):
         q = {"pl": "true", "mts.0": "regular", "location": loc, "searchNearby": "true"}
         for i, p in enumerate(part_list):
             q[f"parts.{i}"] = p
-        url = FULFILLMENT_URL + "?" + urllib.parse.urlencode(q)
-        status, body = http_get(url)
-        data = json.loads(body)
-        stores = (
-            data.get("body", {})
-            .get("content", {})
-            .get("pickupMessage", {})
-            .get("stores", [])
-        )
+        qs = urllib.parse.urlencode(q)
+        candidates = [
+            FULFILLMENT_URL + "?" + qs,
+            "https://www.apple.com/sg/shop/retail/pickup-message?" + qs,
+        ]
+        stores, last_err = [], None
+        for attempt in range(len(USER_AGENTS)):
+            _ua_index = attempt
+            for url in candidates:
+                try:
+                    status, body = http_get(url, json_req=True)
+                    data = json.loads(body)
+                    stores = (
+                        data.get("body", {})
+                        .get("content", {})
+                        .get("pickupMessage", {})
+                        .get("stores", [])
+                    ) or data.get("body", {}).get("stores", [])
+                    if stores:
+                        print(f"OK via {url.split('?')[0]} (UA #{attempt})")
+                        break
+                    last_err = f"no stores in response from {url.split('?')[0]}"
+                except Exception as e:
+                    last_err = f"{url.split('?')[0]} -> {e}"
+                    print("   attempt failed:", last_err)
+                    time.sleep(2)
+            if stores:
+                break
         if not stores:
-            raise RuntimeError(f"no stores in fulfillment response (status {status})")
+            raise RuntimeError(last_err or "no stores in fulfillment response")
         for s in stores:
             store = s.get("storeName", "?")
             for p, info in (s.get("partsAvailability") or {}).items():
@@ -196,6 +249,7 @@ def main():
     print(f"[{now_sgt()}] iPhone Duo pickup check starting (test_mode={test_mode})")
 
     try:
+        warm_up()
         parts = discover_parts(state)
         if not parts:
             raise RuntimeError("could not discover any part numbers")

@@ -157,29 +157,26 @@ def discover_parts(state):
         print("Using cached part numbers:", cached)
         return cached
 
-    parts = dict(cached)
-    for storage, colour, slug in CONFIGS:
-        label = f"{storage} {colour}"
-        if label in parts.values():
-            continue
-        url = f"{BUY_URL}/{slug}"
+    # Collect every part number mentioned on the buy page and the config pages.
+    # Labels are filled in later from Apple's own availability reply.
+    found = set()
+    pages = [BUY_URL] + [f"{BUY_URL}/{slug}" for _, _, slug in CONFIGS]
+    for url in pages:
         try:
             status, html = http_get(url)
         except Exception as e:
-            print(f"   discovery failed for {label}: {e}")
+            print(f"   discovery failed for {url}: {e}")
             continue
-        found = PART_RE.findall(html)
-        # The config page lists its own part first; keep SG-suffixed ones if present.
-        sg = [p for p in found if p.endswith("ZA/A")]
-        pick = (sg or found or [None])[0]
-        if pick:
-            parts[pick] = label
-            print(f"   {label}: {pick}")
-        else:
-            print(f"   {label}: no part number found on {url}")
+        hits = PART_RE.findall(html)
+        found.update(hits)
+        print(f"   {url.rsplit('/', 1)[-1]}: {len(set(hits))} part numbers")
+        if len(found) >= len(CONFIGS):
+            break
         time.sleep(1)
 
-    state["parts"] = parts
+    sg = sorted(p for p in found if p.endswith("ZA/A"))
+    parts = {p: p for p in (sg or sorted(found))}
+    print("Discovered:", list(parts))
     return parts
 
 
@@ -192,6 +189,7 @@ def check_pickup(parts):
     global _ua_index
     available = []
     seen = {}
+    skipped = set()
     part_list = list(parts.keys())
     for loc in LOCATIONS:
         q = {"pl": "true", "mts.0": "regular", "location": loc, "searchNearby": "true"}
@@ -230,16 +228,38 @@ def check_pickup(parts):
         for s in stores:
             store = s.get("storeName", "?")
             for p, info in (s.get("partsAvailability") or {}).items():
-                label = parts.get(p, p)
+                regular = (info.get("messageTypes") or {}).get("regular") or {}
+                title = (
+                    regular.get("storePickupProductTitle")
+                    or info.get("storePickupProductTitle")
+                    or ""
+                )
+                # Keep only the phones themselves (the pages also mention cases etc.)
+                if title and (
+                    "duo" not in title.lower()
+                    or "case" in title.lower()
+                    or "folio" in title.lower()
+                ):
+                    skipped.add(p)
+                    continue
+                label = (
+                    title.replace("iPhone Duo", "").strip()
+                    if title else (parts.get(p) if parts.get(p) != p else p)
+                )
+                if title:
+                    parts[p] = label  # remember Apple's own label for next time
                 disp = (info.get("pickupDisplay") or "").lower()
                 quote = (
                     info.get("pickupSearchQuote")
-                    or info.get("messageTypes", {}).get("regular", {}).get("storePickupQuote")
+                    or regular.get("storePickupQuote")
                     or ""
                 )
                 seen[(store, label)] = f"{disp} — {quote}".strip(" —")
                 if disp == "available":
                     available.append((store, label, quote))
+    # Forget any part numbers that turned out not to be phones.
+    for p in skipped:
+        parts.pop(p, None)
     return available, seen
 
 
@@ -254,6 +274,7 @@ def main():
         if not parts:
             raise RuntimeError("could not discover any part numbers")
         available, seen = check_pickup(parts)
+        state["parts"] = parts  # cache Apple's labels for future runs
         state["error_streak"] = 0
     except Exception as e:
         state["error_streak"] = state.get("error_streak", 0) + 1
